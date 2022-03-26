@@ -1,12 +1,13 @@
 import jax
+import typing as t
 import haiku as hk
 import jax.numpy as jnp
 
-from einops import rearrange, repeat
+from einops import rearrange, repeat, reduce
 
 
 class SelfAttention(hk.Module):
-    def __init__(self, k, heads):
+    def __init__(self, k: int, heads: int):
         super().__init__()
         self.k = k
         self.heads = heads
@@ -16,7 +17,7 @@ class SelfAttention(hk.Module):
         self.to_values = hk.Linear(k*heads, with_bias=False)
         self.unify_heads = hk.Linear(k)
 
-    def __call__(self, x):
+    def __call__(self, x: jnp.ndarray):
         h = self.heads
         k = self.k
 
@@ -32,17 +33,20 @@ class SelfAttention(hk.Module):
         keys = keys / (k ** (1/4))
 
         dot = jax.lax.batch_matmul(queries, rearrange(keys, "b t k -> b k t"))
+
+        # send attention heads as additional output
+        heads = rearrange(dot, "(b h) t k -> b h t k", h=h)
         dot = jax.nn.softmax(dot, axis=2)
 
         out = rearrange(jax.lax.batch_matmul(dot, values),
                         "(b h) t k -> b t (h k)", h=h)
         attention = self.unify_heads(out)
 
-        return attention
+        return attention, heads
 
 
 class TransformerBlock(hk.Module):
-    def __init__(self, k, heads, dropout):
+    def __init__(self, k: int, heads: int, dropout: float):
         super().__init__()
         self.k = k
         self.heads = heads
@@ -57,10 +61,10 @@ class TransformerBlock(hk.Module):
         self.layer_norm_2 = hk.LayerNorm(
             axis=[-2, -1], create_scale=True, create_offset=True)
 
-    def __call__(self, x, inference=False):
+    def __call__(self, x: jnp.ndarray, inference=False):
         dropout = 0. if inference else self.dropout
-
-        x = self.layer_norm_1(self.attention(x)) + x
+        x, heads = self.attention(x)
+        x = self.layer_norm_1(x) + x
 
         key1 = hk.next_rng_key()
         key2 = hk.next_rng_key()
@@ -72,11 +76,20 @@ class TransformerBlock(hk.Module):
         forward = self.layer_norm_2(forward + x)
         out = hk.dropout(key2, dropout, forward)
 
-        return out
+        return out, heads
 
 
 class VisionTransformer(hk.Module):
-    def __init__(self, k, heads, depth, num_classes, patch_size, image_size, dropout):
+    def __init__(
+        self,
+        k,
+        heads: int,
+        depth: int,
+        num_classes: int,
+        patch_size: int,
+        image_size: t.Tuple[int, int],
+        dropout: float
+    ):
         super().__init__()
         self.k = k
         self.heads = heads
@@ -88,9 +101,13 @@ class VisionTransformer(hk.Module):
 
         # Patch embedding is just a dense layer mapping a flattened patch to another array
         self.token_emb = hk.Linear(self.k)
-        self.blocks = hk.Sequential([
+        # self.blocks = hk.Sequential([
+        #     TransformerBlock(self.k, self.heads, dropout) for _ in range(self.depth)
+        # ])
+
+        self.blocks = [
             TransformerBlock(self.k, self.heads, dropout) for _ in range(self.depth)
-        ])
+        ]
         self.classification = hk.Linear(self.num_classes)
         height, width = image_size
         num_patches = (height // patch_size) * (width // patch_size) + 1
@@ -118,8 +135,54 @@ class VisionTransformer(hk.Module):
         pos_emb = self.pos_emb(positions)
         x = pos_emb + combined_tokens
         x = hk.dropout(hk.next_rng_key(), dropout, x)
-        x = self.blocks(x)
+        # x = self.blocks(x)
+
+        attention_heads = []
+        for block in self.blocks:
+            x, heads = block(x)
+            attention_heads.append(heads)
+
+        rollout = attention_rollout(attention_heads, discard_ratio=0.5, head_fusion="max")
+
         x = x[:, 0]
         x = self.classification(x)
 
-        return x
+        return x, rollout
+
+
+def attention_rollout(
+    attention_heads: t.List[jnp.ndarray],
+    discard_ratio: float,
+    head_fusion: str
+) -> jnp.ndarray:
+    batch, _, tokens, _ = attention_heads[0].shape
+    rollout = repeat(jnp.eye(tokens), "h1 h2 -> b h1 h2", b=batch)
+
+    # Multiply attention in each block together
+    for attention in attention_heads:
+        if head_fusion == "mean":
+            attention_heads_fused = attention.mean(axis=1)
+        elif head_fusion == "max":
+            attention_heads_fused = attention.max(axis=1)
+        elif head_fusion == "min":
+            attention_heads_fused = attention.min(axis=1)
+        else:
+            raise ValueError("Attention head fusion type Not supported")
+
+        # TODO: Add functionality to discard lower attention values per matrix
+        # flat_attn = rearrange(attention_heads_fused, "b h w -> b (h w)")
+        # _, indices = jax.lax.top_k(-flat_attn, k=int(discard_ratio*tokens*tokens))
+
+        # Compute attention rollout
+        identity = repeat(jnp.eye(tokens), "x y -> b x y", b=batch)
+        a = (attention_heads_fused + 1.0 * identity) / 2
+        # Normalize values over embedding axis
+        a = a / reduce(a, "b h1 h2 -> b h1 1", "sum")
+        rollout = jax.lax.batch_matmul(a, rollout)
+
+    masks = rollout[:, 0, 1:]
+    width = int((tokens - 1) ** 0.5)
+    masks = rearrange(masks, "b (w1 w2) -> b w1 w2", w1=width, w2=width)
+    masks = masks / reduce(masks, "b w1 w2 -> b 1 1", "max")
+
+    return rollout

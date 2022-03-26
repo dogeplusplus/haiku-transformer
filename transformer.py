@@ -100,14 +100,14 @@ def main():
 
     @jax.jit
     def loss_fn(params, key, xs, ys):
-        logits = transformer.apply(params, key, xs)
+        logits, rollout = transformer.apply(params, key, xs)
         one_hot = jax.nn.one_hot(ys, num_classes=num_classes)
         loss = optax.softmax_cross_entropy(logits, one_hot).mean()
         return loss
 
     @jax.jit
     def calculate_metrics(params, key, xs, ys, k=5):
-        logits = transformer.apply(params, key, xs)
+        logits, _ = transformer.apply(params, key, xs)
         classes = logits.argmax(axis=-1)
         accuracy = jnp.mean(classes == ys)
 
