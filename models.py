@@ -1,6 +1,7 @@
 import jax
 import typing as t
 import haiku as hk
+import numpy as np
 import jax.numpy as jnp
 
 from einops import rearrange, repeat, reduce
@@ -101,10 +102,6 @@ class VisionTransformer(hk.Module):
 
         # Patch embedding is just a dense layer mapping a flattened patch to another array
         self.token_emb = hk.Linear(self.k)
-        # self.blocks = hk.Sequential([
-        #     TransformerBlock(self.k, self.heads, dropout) for _ in range(self.depth)
-        # ])
-
         self.blocks = [
             TransformerBlock(self.k, self.heads, dropout) for _ in range(self.depth)
         ]
@@ -135,7 +132,6 @@ class VisionTransformer(hk.Module):
         pos_emb = self.pos_emb(positions)
         x = pos_emb + combined_tokens
         x = hk.dropout(hk.next_rng_key(), dropout, x)
-        # x = self.blocks(x)
 
         attention_heads = []
         for block in self.blocks:
@@ -169,13 +165,24 @@ def attention_rollout(
         else:
             raise ValueError("Attention head fusion type Not supported")
 
-        # TODO: Add functionality to discard lower attention values per matrix
-        # flat_attn = rearrange(attention_heads_fused, "b h w -> b (h w)")
-        # _, indices = jax.lax.top_k(-flat_attn, k=int(discard_ratio*tokens*tokens))
+        flat_attn = rearrange(attention_heads_fused, "b h w -> b (h w)")
+        # Take the top percentile across the last axis
+        threshold = jnp.percentile(flat_attn, 1 - discard_ratio, axis=-1, keepdims=True)
+
+        # Mask to keep the class token
+        cls_indices = np.zeros(flat_attn.shape)
+        cls_indices[:, 0] = 1
+        cls_indices = jnp.array(cls_indices)
+
+        # Keep values that are in the top percentile or are the cls indices
+        keep_mask = jnp.logical_or(flat_attn > threshold, cls_indices)
+        flat_attn = jnp.where(keep_mask, flat_attn, 0)
+
+        filtered_attn = rearrange(flat_attn, "b (h w) -> b h w", h=tokens, w=tokens)
 
         # Compute attention rollout
         identity = repeat(jnp.eye(tokens), "x y -> b x y", b=batch)
-        a = (attention_heads_fused + 1.0 * identity) / 2
+        a = (filtered_attn + 1.0 * identity) / 2
         # Normalize values over embedding axis
         a = a / reduce(a, "b h1 h2 -> b h1 1", "sum")
         rollout = jax.lax.batch_matmul(a, rollout)
