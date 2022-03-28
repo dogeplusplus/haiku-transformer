@@ -149,6 +149,17 @@ def main():
         mlflow.log_param("dropout", args.dropout)
         mlflow.log_param("num_params", param_count)
 
+        # Log model parameters for loading
+        mlflow.log_dict({
+            "k": args.k,
+            "heads": args.heads,
+            "depth": args.depth,
+            "num_classes": num_classes,
+            "patch_size": args.patch_size,
+            "image_size": image_size,
+            "dropout": args.dropout,
+        }, "config.json")
+
     for e in range(args.epochs):
         step = 0
         metrics_dict = defaultdict(lambda: 0)
