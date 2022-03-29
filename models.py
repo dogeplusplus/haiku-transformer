@@ -138,7 +138,7 @@ class VisionTransformer(hk.Module):
             x, heads = block(x)
             attention_heads.append(heads)
 
-        rollout = attention_rollout(attention_heads, discard_ratio=0.5, head_fusion="max")
+        rollout = attention_rollout(attention_heads, head_fusion="max", discard_ratio=0.5)
 
         x = x[:, 0]
         x = self.classification(x)
@@ -148,8 +148,8 @@ class VisionTransformer(hk.Module):
 
 def attention_rollout(
     attention_heads: t.List[jnp.ndarray],
-    discard_ratio: float,
-    head_fusion: str
+    head_fusion: str,
+    discard_ratio: float = 0,
 ) -> jnp.ndarray:
     batch, _, tokens, _ = attention_heads[0].shape
     rollout = repeat(jnp.eye(tokens), "h1 h2 -> b h1 h2", b=batch)
@@ -165,20 +165,23 @@ def attention_rollout(
         else:
             raise ValueError("Attention head fusion type Not supported")
 
-        flat_attn = rearrange(attention_heads_fused, "b h w -> b (h w)")
-        # Take the top percentile across the last axis
-        threshold = jnp.percentile(flat_attn, 1 - discard_ratio, axis=-1, keepdims=True)
+        if discard_ratio != 0:
+            flat_attn = rearrange(attention_heads_fused, "b h w -> b (h w)")
+            # Take the top percentile across the last axis
+            threshold = jnp.percentile(flat_attn, 1 - discard_ratio, axis=-1, keepdims=True)
 
-        # Mask to keep the class token
-        cls_indices = np.zeros(flat_attn.shape)
-        cls_indices[:, 0] = 1
-        cls_indices = jnp.array(cls_indices)
+            # Mask to keep the class token
+            cls_indices = np.zeros(flat_attn.shape)
+            cls_indices[:, 0] = 1
+            cls_indices = jnp.array(cls_indices)
 
-        # Keep values that are in the top percentile or are the cls indices
-        keep_mask = jnp.logical_or(flat_attn > threshold, cls_indices)
-        flat_attn = jnp.where(keep_mask, flat_attn, 0)
+            # Keep values that are in the top percentile or are the cls indices
+            keep_mask = jnp.logical_or(flat_attn > threshold, cls_indices)
+            flat_attn = jnp.where(keep_mask, flat_attn, 0)
 
-        filtered_attn = rearrange(flat_attn, "b (h w) -> b h w", h=tokens, w=tokens)
+            filtered_attn = rearrange(flat_attn, "b (h w) -> b h w", h=tokens, w=tokens)
+        else:
+            filtered_attn = attention_heads_fused
 
         # Compute attention rollout
         identity = repeat(jnp.eye(tokens), "x y -> b x y", b=batch)
