@@ -168,7 +168,7 @@ def attention_rollout(
         if discard_ratio != 0:
             flat_attn = rearrange(attention_heads_fused, "b h w -> b (h w)")
             # Take the top percentile across the last axis
-            threshold = jnp.percentile(flat_attn, 1 - discard_ratio, axis=-1, keepdims=True)
+            threshold = jnp.percentile(flat_attn, (1 - discard_ratio) * 100, axis=-1, keepdims=True)
 
             # Mask to keep the class token
             cls_indices = np.zeros(flat_attn.shape)
