@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "haiku-transformer"
 version = "0.1.0"
-description = "Python template repository"
+description = "Vision Transformer using jax and dm-haiku"
 authors = ["dogeplusplus <albertswchung@gmail.com>"]
 
 [tool.poetry.dependencies]
